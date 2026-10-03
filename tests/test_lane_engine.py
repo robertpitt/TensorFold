@@ -292,3 +292,53 @@ def test_a_prompt_chunks_host_reads_start_one_chunk_ahead() -> None:
     engine.prefill_prefix(list(range(1, 11)))
     assert calls == [("ahead", 0, 4), ("ahead", 4, 8), ("forward", 4), ("ahead", 8, 10), ("forward", 4),
                      ("forward", 2)]
+
+
+@pytest.mark.parametrize("count", [1, 3])
+def test_deferred_verification_commits_every_accepted_window_once(count) -> None:
+    """A model leaving history untouched until acceptance must work for full and partial shared windows."""
+    import mlx.core as mx
+    import numpy as np
+    from tests.lane_fakes import FakeFamily
+
+    class Deferred(FakeFamily):
+        defer_verification_commit = True
+
+        def __init__(self):
+            super().__init__()
+            self.records = {}
+            self.commits = []
+
+        def hidden(self, inputs, cache, parents=None):
+            if parents is None:
+                return super().hidden(inputs, cache)
+            assert id(cache) not in self.records
+            tokens = np.array(inputs).reshape(-1).tolist()
+            self.records[id(cache)] = tokens
+            shadow = [FakeBatchItem([list(cache[0].rows[0])])]
+            return super().hidden(inputs, shadow)
+
+        def hidden_rows(self, windows, caches, parents=None):
+            assert parents is not None
+            return mx.concatenate([self.hidden(w, c, p) for w, c, p in zip(windows, caches, parents)], axis=1)
+
+        def keep_rows(self, cache, rows, keep):
+            tokens = self.records.pop(id(cache))
+            assert rows == len(tokens)
+            path = list(range(keep)) if isinstance(keep, int) else keep
+            cache[0].rows[0].extend(tokens[r] for r in path)
+            self.commits.append((rows, len(path)))
+
+    from tests.lane_fakes import FakeBatchItem
+    model = Deferred()
+    engine = FakeEngine(model, max_rows=7, max_draft=6)
+    streams = [LaneStream(f"s{i}", [i + 1, 4, 7], 45, proposer=PatternProposer([6, 0, 3])) for i in range(count)]
+    for stream in streams:
+        engine.add_stream(stream)
+    while engine.active_count:
+        engine.step()
+    assert not model.records
+    assert any(rows > keep for rows, keep in model.commits)
+    assert any(rows == keep and rows > 1 for rows, keep in model.commits)
+    for stream in streams:
+        assert stream.emitted == fake_serial(stream.prompt_ids, 45, set())

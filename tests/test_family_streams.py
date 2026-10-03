@@ -125,6 +125,39 @@ SPECS = [  # prompt, thinking budget, max tokens, drafts on
 ]
 
 
+def test_late_draft_hook_receives_host_tokens_and_preserves_target_output():
+    class Direct(StreamsModel):
+        def __init__(self):
+            super().__init__(wrong_every=3)
+            self.legacy_calls = 0
+            self.direct_calls = []
+
+        def speculate(self, *args, **kwargs):
+            self.legacy_calls += 1
+            return super().speculate(*args, **kwargs)
+
+        def draft_tokens(self, cache, follow, rows, position, sampling, count):
+            assert isinstance(follow, list) and isinstance(rows, list)
+            assert len(follow) == len(rows)
+            self.direct_calls.append((position, count))
+            if not count:
+                return []
+            out = [self._guess(follow[-1])]
+            while len(out) < count:
+                out.append(self._guess(out[-1]))
+            return out
+
+    model = Direct()
+    engine = LaneEngine(model)
+    stream = LaneStream("direct", [8, 2], 25)
+    engine.add_stream(stream)
+    while engine.active_count:
+        engine.step()
+    assert stream.emitted == chain(2, 0, 25)
+    assert model.legacy_calls == 1                    # the first prompt draft; every decode round uses host tokens
+    assert len(model.direct_calls) == stream.rounds
+
+
 def _stream(i, spec):
     prompt, budget, max_new, drafts = spec
     return LaneStream(stream_id=f"s{i}", prompt_ids=list(prompt), max_new_tokens=max_new, think_budget=budget,
