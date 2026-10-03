@@ -86,12 +86,14 @@ class SharedRounds:
         lengths = [int(w.shape[0]) for w in windows]
         rows_parents = [self._row_parents(n, p[6]) for p, n in zip(plans, lengths)]
         trees = any(p[6] is not None for p in plans)
-        hidden = (model.hidden_rows(windows, [p[1] for p in plans], parents=rows_parents) if trees
+        defer_commit = bool(getattr(model, "defer_verification_commit", False))
+        hidden = (model.hidden_rows(windows, [p[1] for p in plans], parents=rows_parents) if trees or defer_commit
                   else model.hidden_rows(windows, [p[1] for p in plans]))
         logits = model.head(hidden)
         logits = logits.reshape(logits.shape[1:])
         offsets = [sum(lengths[:k]) for k in range(len(plans))]
-        positions = [[plan[2] + 1 + d for d in tree_paths(rp)[0]] for plan, rp in zip(plans, rows_parents)]
+        positions = [[plan[2] + 1 + d for d in (range(n) if plan[6] is None else tree_paths(rp)[0])]
+                     for plan, rp, n in zip(plans, rows_parents, lengths)]
         kept = [self._grammar_window.pop(plan[0].stream_id, None) for plan in plans]
         if any(w is not None for w in kept):                 # a constrained stream's rows, masked by their paths
             logits = mx.concatenate([
@@ -115,7 +117,8 @@ class SharedRounds:
             else:
                 proposed = [int(t) for t in drafts]
             window = [int(stream.pending[-1]), *proposed]
-            got, path, cut, follow = self._conclude(stream, kind, forced, sampled, window, rp)
+            got, path, cut, follow = self._conclude(stream, kind, forced, sampled, window, rp,
+                                                   chain=plan[6] is None)
             paths.append(path)
             follows.append(follow)
             out[stream.stream_id] = (got, n, len(path))

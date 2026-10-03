@@ -250,8 +250,8 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
 
         import mlx.core as mx
 
-        pending = mx.array([stream.pending[-1]], dtype=mx.uint32)
         if isinstance(drafts, mx.array):
+            pending = mx.array([stream.pending[-1]], dtype=mx.uint32)
             return mx.concatenate([pending, drafts.astype(mx.uint32)])
         return mx.array([stream.pending[-1], *[int(t) for t in drafts]], dtype=mx.uint32)
 
@@ -264,7 +264,8 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
         return [-1, *[0 if q < 0 else q + 1 for q in parents]]
 
     def _conclude(self, stream: Any, kind: str, forced: list[int], sampled: list[int], window: list[int],
-                  rows_parents: list[int]) -> tuple[list[int], list[int], int | None, list[int]]:
+                  rows_parents: list[int], *, chain: bool = False
+                  ) -> tuple[list[int], list[int], int | None, list[int]]:
         """Commit the target-sampled path after the thinking-budget cut, returning landed tokens, kept rows, the cut, and each kept row's following token."""
 
         from tensorfold.kernels.qwen.dense.v1.lane_tree import accept_path, tree_paths
@@ -275,7 +276,13 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
             bonus = stream.force.pop(0) if stream.force else sampled[-1]
             committed = [*forced, bonus]
         else:
-            path = accept_path(window, rows_parents, sampled)
+            if chain:
+                keep = 1
+                while keep < rows and window[keep] == sampled[keep - 1]:
+                    keep += 1
+                path = list(range(keep))
+            else:
+                path = accept_path(window, rows_parents, sampled)
             committed = [*[window[r] for r in path[1:]], sampled[path[-1]]]
             if rows > 1:
                 accepted = len(path) - 1
@@ -292,7 +299,7 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
                         self._copy_width[stream.stream_id] = (min(self.max_copy, 2 * width + 1)
                                                               if accepted == rows - 1 else self.first_copy)
                 elif kind == "head":
-                    self._observe_depth(stream, max(tree_paths(rows_parents)[0]), accepted)
+                    self._observe_depth(stream, rows - 1 if chain else max(tree_paths(rows_parents)[0]), accepted)
         cut = stream.think_cut(committed)
         if cut is not None:
             path = path[:cut + 1]
@@ -339,6 +346,11 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
 
         model = self.model
         depth = self._head_depth(stream, budget)
+        direct = getattr(model, "draft_tokens", None)
+        if callable(direct):
+            self._next[stream.stream_id] = direct(cache, follow, rows, stream.cache_len + 1,
+                                                   stream.sampling, depth)
+            return
         where = ({"start": rows[0]} if rows == list(range(rows[0], rows[0] + len(rows))) else {"rows": list(rows)})
         heads = model.speculate(cache, mx.array(follow, dtype=mx.uint32), position, stream.sampling, **where,
                                 last_only=True)
@@ -366,8 +378,9 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
         inputs = self._window_tokens(stream, drafts)
         rows = int(inputs.shape[0])
         rows_parents = self._row_parents(rows, parents)
-        depths = tree_paths(rows_parents)[0]
-        tree = {} if parents is None else {"parents": rows_parents}
+        depths = range(rows) if parents is None else tree_paths(rows_parents)[0]
+        defer_commit = bool(getattr(model, "defer_verification_commit", False))
+        tree = {} if parents is None and not defer_commit else {"parents": rows_parents}
         hidden = model.hidden(inputs.reshape(1, rows), cache, **tree)
         logits = model.head(hidden)
         logits = logits.reshape(logits.shape[1:])            # [R, V] as a view (MLX's [0] is a gather)
@@ -394,10 +407,11 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
         firsts = values[rows:2 * rows] if speculate else []
         proposed = values[-(rows - 1):] if isinstance(drafts, mx.array) and rows > 1 else [int(t) for t in drafts]
         window = [int(stream.pending[-1]), *proposed]          # the rows' tokens, the pending one first
-        got, path, cut, follow = self._conclude(stream, kind, forced, sampled, window, rows_parents)
+        got, path, cut, follow = self._conclude(stream, kind, forced, sampled, window, rows_parents,
+                                               chain=parents is None)
         keep = len(path)
-        if keep < rows or parents is not None:      # a tree commits in keep_rows, even one kept whole
-            model.keep_rows(cache, rows, keep if self._is_prefix(path) else path)
+        if defer_commit or keep < rows or parents is not None:
+            model.keep_rows(cache, rows, keep if parents is None or self._is_prefix(path) else path)
         if self.family_mtp and stream.drafts:
             if speculate and cut is None:
                 self._next[stream.stream_id] = model.settle(cache, keep, firsts[path[-1]], stream.cache_len + 1,

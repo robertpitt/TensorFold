@@ -26,6 +26,8 @@ class Qwen35Family:
     lane_family = True
     draft_reads_hidden = False      # the DFlash head drafts from the tapped layers, never the last hidden state
     speculate_early = False            # DFlash2 reads the kept rows' taps after a round is read
+    # Passing chain parents leaves recurrence commit to the engine's accepted-path selection.
+    defer_verification_commit = True
     batch_rows = 128                   # a shared forward's rows (the lane matmul's limit; the costs decide how many)
     max_streams = 64
     draft_prior = (0.78, 0.74, 0.71, 0.73, 0.71, 0.75, 0.78, 0.75, 0.75, 0.75, 0.75, 0.7, 0.7, 0.7, 0.7)
@@ -79,9 +81,12 @@ class Qwen35Family:
         return next(int(item.offset) for item in layers if hasattr(item, "keys") and hasattr(item, "offset"))
 
     def hidden(self, inputs: Any, cache: list[Any], parents: Sequence[int] | None = None) -> Any:
-        """Return hidden states [1, R, D]; chains advance all rows, while trees wait for keep_rows to commit the accepted path."""
+        """Return hidden states [1, R, D]; explicit parents defer commit, including chains used for verification."""
 
-        tokens, layers = _tokens(inputs), self._layers(cache)
+        import mlx.core as mx
+
+        tokens = inputs.reshape(-1) if self.rows and isinstance(inputs, mx.array) else _tokens(inputs)
+        layers = self._layers(cache)
         start, rows = self._position(layers), len(tokens)
         tree = list(parents) if parents is not None else _chain(rows)
         if self.rows:
@@ -141,9 +146,11 @@ class Qwen35Family:
 
     def hidden_rows(self, windows: Sequence[Any], caches: Sequence[list[Any]],
                     parents: Sequence[Sequence[int]] | None = None) -> Any:
-        """Return hidden states [1, N, D] grouped by stream; chains advance caches, while trees wait for keep_rows_streams."""
+        """Return hidden states [1, N, D] grouped by stream; explicit parents defer to keep_rows_streams."""
 
-        tokens = [_tokens(w) for w in windows]
+        import mlx.core as mx
+
+        tokens = [w.reshape(-1) if self.rows and isinstance(w, mx.array) else _tokens(w) for w in windows]
         layers = [self._layers(c) for c in caches]
         starts = [self._position(c) for c in layers]
         trees = [list(p) for p in parents] if parents is not None else [_chain(len(t)) for t in tokens]
@@ -230,6 +237,13 @@ class Qwen35Family:
         return mx.array([0], dtype=mx.uint32)
 
     def settle(self, cache: list[Any], keep: int, first: Any, position: int, sampling: Any, count: int) -> Any:
+        return self.head_drafts.tree(cache, position, sampling, count) if count > 0 else []
+
+    def draft_tokens(self, cache: list[Any], follow: list[int], rows: list[int], position: int,
+                     sampling: Any, count: int) -> Any:
+        """Draft directly from accepted host tokens, without a GPU upload/readback or unused head output."""
+
+        self.head_drafts.read(cache, rows, follow, sampling)
         return self.head_drafts.tree(cache, position, sampling, count) if count > 0 else []
 
     def unspeculate(self, cache: list[Any]) -> None:
